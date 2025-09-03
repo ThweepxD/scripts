@@ -1,0 +1,297 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+LOG_FILE="setup.log"
+ERROR_LOG="errors.log"
+SUMMARY_JSON="summary.json"
+DISCORD_WEBHOOK_URL="https://discordapp.com/api/webhooks/1412280278533144666/53oHRNs4WGdaxWz8qbeVipDRiD3hamTYi9FBhv9cxjoksjBprbTUdhwZxWrFIO69KBRa"
+
+# Check if ts command exists, if not install moreutils first
+if ! command -v ts &> /dev/null; then
+    echo "Installing moreutils for timestamping..."
+    brew install moreutils
+fi
+
+exec > >(ts '[%Y-%m-%d %H:%M:%S]' | tee -i "$LOG_FILE")
+exec 2> >(ts '[%Y-%m-%d %H:%M:%S]' | tee -i "$LOG_FILE" "$ERROR_LOG" >&2)
+
+trap 'echo -e "\033[31mUnexpected error on line $LINENO. Exiting.\033[0m" | tee -a "$ERROR_LOG"; send_discord "❌ Unexpected error on line $LINENO"; exit 1' ERR
+
+# ---- Flags ----
+DRY_RUN=false
+RETRY_COUNT=3
+RETRY_DELAY=2
+
+for arg in "$@"; do
+  case $arg in
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    --retries=*)
+      RETRY_COUNT="${arg#*=}"
+      ;;
+    --delay=*)
+      RETRY_DELAY="${arg#*=}"
+      ;;
+  esac
+done
+
+SUCCESS_LIST=()
+FAILED_LIST=()
+SKIPPED_LIST=()
+
+send_discord() {
+  if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+    curl -s -H "Content-Type: application/json" \
+      -X POST -d "{\"content\":\"$1\"}" "$DISCORD_WEBHOOK_URL" >/dev/null || true
+  fi
+}
+
+handle_error() {
+  echo -e "\033[31mError occurred during the installation of $1.\033[0m" | tee -a "$ERROR_LOG"
+  FAILED_LIST+=("$1")
+  send_discord "⚠️ Failed to install **$1**"
+}
+
+retry_cmd() {
+  local cmd=$1
+  local label=$2
+  local count=0
+  until eval "$cmd"; do
+    count=$((count+1))
+    if (( count >= RETRY_COUNT )); then
+      handle_error "$label"
+      return 1
+    fi
+    echo -e "\033[33mRetrying $label ($count/$RETRY_COUNT) after $RETRY_DELAY seconds...\033[0m"
+    sleep "$RETRY_DELAY"
+  done
+  SUCCESS_LIST+=("$label")
+  send_discord "✅ Successfully installed **$label**"
+}
+
+check_internet() {
+  if ! ping -c 1 google.com &>/dev/null; then
+    echo -e "\033[31mNo internet connection. Please check your connection and try again.\033[0m" | tee -a "$ERROR_LOG"
+    send_discord "❌ No internet connection detected. Aborting."
+    exit 1
+  fi
+}
+
+install_homebrew() {
+  if command -v brew &>/dev/null; then
+    echo -e "\033[33mHomebrew is already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("Homebrew")
+    return
+  fi
+
+  echo "Installing Homebrew..."
+  if $DRY_RUN; then
+    echo "DRY RUN: Would install Homebrew"
+    SUCCESS_LIST+=("Homebrew")
+  else
+    if /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+      SUCCESS_LIST+=("Homebrew")
+      send_discord "✅ Successfully installed **Homebrew**"
+      echo -e "\033[32mHomebrew installed successfully!\033[0m"
+    else
+      handle_error "Homebrew"
+    fi
+  fi
+}
+
+install_package() {
+  if brew list "$1" &>/dev/null; then
+    echo -e "\033[33m$1 is already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("$1")
+  else
+    echo "Installing $1..."
+    $DRY_RUN || retry_cmd "brew install \"$1\"" "$1 (Homebrew)"
+  fi
+}
+
+install_cask() {
+  if brew list --cask "$1" &>/dev/null; then
+    echo -e "\033[33m$1 is already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("$1")
+  else
+    echo "Installing $1..."
+    $DRY_RUN || retry_cmd "brew install --cask \"$1\"" "$1 (Cask)"
+  fi
+}
+
+install_mas_app() {
+  local app_id=$1
+  local app_name=$2
+  
+  if mas list | grep -q "$app_id"; then
+    echo -e "\033[33m$app_name is already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("$app_name")
+  else
+    echo "Installing $app_name..."
+    $DRY_RUN || retry_cmd "mas install \"$app_id\"" "$app_name (Mac App Store)"
+  fi
+}
+
+install_lazyvim() {
+  echo "Setting up LazyVim..."
+  
+  # Check if LazyVim is already installed
+  if [[ -d "$HOME/.config/nvim" ]] && [[ -f "$HOME/.config/nvim/lua/config/lazy.lua" ]]; then
+    echo -e "\033[33mLazyVim appears to be already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("LazyVim")
+    return
+  fi
+  
+  # Backup existing nvim config if it exists
+  if [[ -d "$HOME/.config/nvim" ]]; then
+    echo "Backing up existing Neovim config..."
+    $DRY_RUN || mv "$HOME/.config/nvim" "$HOME/.config/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  if [[ -d "$HOME/.local/share/nvim" ]]; then
+    echo "Backing up existing Neovim data..."
+    $DRY_RUN || mv "$HOME/.local/share/nvim" "$HOME/.local/share/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  if [[ -d "$HOME/.local/state/nvim" ]]; then
+    echo "Backing up existing Neovim state..."
+    $DRY_RUN || mv "$HOME/.local/state/nvim" "$HOME/.local/state/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  if [[ -d "$HOME/.cache/nvim" ]]; then
+    echo "Backing up existing Neovim cache..."
+    $DRY_RUN || mv "$HOME/.cache/nvim" "$HOME/.cache/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  # Clone LazyVim starter template
+  if $DRY_RUN; then
+    echo "DRY RUN: Would clone LazyVim starter template"
+    SUCCESS_LIST+=("LazyVim")
+  else
+    if git clone https://github.com/LazyVim/starter "$HOME/.config/nvim"; then
+      # Remove .git folder to make it your own
+      rm -rf "$HOME/.config/nvim/.git"
+      SUCCESS_LIST+=("LazyVim")
+      send_discord "✅ Successfully installed **LazyVim**"
+      echo -e "\033[32mLazyVim installed successfully! Run 'nvim' to complete setup.\033[0m"
+    else
+      handle_error "LazyVim"
+    fi
+  fi
+}
+
+progress_bar() {
+  local total=$1
+  local current=$2
+  local percent=$((current * 100 / total))
+  local filled=$((percent / 2))
+  local empty=$((50 - filled))
+  printf "\r["
+  printf "%0.s#" $(seq 1 "$filled")
+  printf "%0.s-" $(seq 1 "$empty")
+  printf "] %d%%" "$percent"
+}
+
+increment_progress() {
+  {
+    CURRENT=$((CURRENT+1))
+    progress_bar "$TOTAL" "$CURRENT"
+  } 200>/tmp/progress.lock
+}
+
+# ---- Config ----
+HOMEBREW_PACKAGES=(
+  git wget curl vim neovim htop nano ffmpeg
+  python3 node npm unzip p7zip tree
+  moreutils android-platform-tools
+)
+
+CASK_APPS=(
+  visual-studio-code
+  brave-browser
+  discord
+  steam
+  vlc
+  spotify
+  docker
+  iterm2
+  rectangle
+  alfred
+  cleanmymac
+  the-unarchiver
+)
+
+# Mac App Store apps (requires 'mas' to be installed first)
+MAS_APPS=(
+  "497799835:Xcode"
+  "1295203466:Microsoft Remote Desktop"
+  "409183694:Keynote"
+  "409201541:Pages"
+  "409203825:Numbers"
+)
+
+TOTAL=$(( ${#HOMEBREW_PACKAGES[@]} + ${#CASK_APPS[@]} + ${#MAS_APPS[@]} + 3 ))
+CURRENT=0
+
+# ---- Run ----
+check_internet
+send_discord "🚀 Starting macOS setup with $TOTAL tasks..."
+
+# Install Homebrew first
+install_homebrew
+increment_progress
+
+echo "Updating Homebrew..."
+$DRY_RUN || brew update
+
+export -f install_package install_cask install_mas_app install_lazyvim handle_error increment_progress progress_bar retry_cmd send_discord
+export TOTAL CURRENT DRY_RUN RETRY_COUNT RETRY_DELAY ERROR_LOG SUCCESS_LIST FAILED_LIST SKIPPED_LIST
+
+printf "%s\n" "${HOMEBREW_PACKAGES[@]}" | xargs -n1 -P"$(sysctl -n hw.ncpu)" bash -c 'install_package "$0"; increment_progress' || true
+
+echo ""
+echo "Installing Cask applications..."
+printf "%s\n" "${CASK_APPS[@]}" | xargs -n1 -P"$(sysctl -n hw.ncpu)" bash -c 'install_cask "$0"; increment_progress' || true
+
+echo ""
+echo "Installing Mac App Store CLI..."
+install_package "mas"
+
+echo ""
+echo "Installing Mac App Store applications..."
+for app in "${MAS_APPS[@]}"; do
+  IFS=':' read -r app_id app_name <<< "$app"
+  install_mas_app "$app_id" "$app_name"
+  increment_progress
+done
+
+echo ""
+echo "Installing LazyVim..."
+install_lazyvim
+increment_progress
+
+echo ""
+echo "Cleaning up Homebrew cache..."
+$DRY_RUN || brew cleanup
+
+# ---- Summary ----
+echo -e "\n\033[1m===== Setup Summary =====\033[0m"
+if (( ${#SUCCESS_LIST[@]} )); then
+  echo -e "\033[32mSuccessful installs:\033[0m ${SUCCESS_LIST[*]}"
+fi
+if (( ${#SKIPPED_LIST[@]} )); then
+  echo -e "\033[33mSkipped installs:\033[0m ${SKIPPED_LIST[*]}"
+fi
+if (( ${#FAILED_LIST[@]} )); then
+  echo -e "\033[31mFailed installs:\033[0m ${FAILED_LIST[*]}"
+  echo "Check $ERROR_LOG for details."
+fi
+
+echo "" | tee "$SUMMARY_JSON"
+echo "{\n  \"success\": [$(printf '"%s",' "${SUCCESS_LIST[@]}" | sed 's/,$//')],\n  \"skipped\": [$(printf '"%s",' "${SKIPPED_LIST[@]}" | sed 's/,$//')],\n  \"failed\": [$(printf '"%s",' "${FAILED_LIST[@]}" | sed 's/,$//')]\n}" > "$SUMMARY_JSON"
+
+send_discord "📊 macOS setup finished! ✅ ${#SUCCESS_LIST[@]} success, ⚠️ ${#SKIPPED_LIST[@]} skipped, ❌ ${#FAILED_LIST[@]} failed."
+
+echo -e "\033[32mmacOS setup complete!\033[0m"

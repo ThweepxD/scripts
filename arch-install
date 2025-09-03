@@ -1,0 +1,345 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+LOG_FILE="setup.log"
+ERROR_LOG="errors.log"
+SUMMARY_JSON="summary.json"
+DISCORD_WEBHOOK_URL="https://discordapp.com/api/webhooks/1412280278533144666/53oHRNs4WGdaxWz8qbeVipDRiD3hamTYi9FBhv9cxjoksjBprbTUdhwZxWrFIO69KBRa"
+
+exec > >(ts '[%Y-%m-%d %H:%M:%S]' | tee -i "$LOG_FILE")
+exec 2> >(ts '[%Y-%m-%d %H:%M:%S]' | tee -i "$LOG_FILE" "$ERROR_LOG" >&2)
+
+trap 'echo -e "\033[31mUnexpected error on line $LINENO. Exiting.\033[0m" | tee -a "$ERROR_LOG"; send_discord "❌ Unexpected error on line $LINENO"; exit 1' ERR
+
+# ---- Flags ----
+DRY_RUN=false
+RETRY_COUNT=3
+RETRY_DELAY=2
+
+for arg in "$@"; do
+  case $arg in
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    --retries=*)
+      RETRY_COUNT="${arg#*=}"
+      ;;
+    --delay=*)
+      RETRY_DELAY="${arg#*=}"
+      ;;
+  esac
+done
+
+SUCCESS_LIST=()
+FAILED_LIST=()
+SKIPPED_LIST=()
+
+send_discord() {
+  if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+    curl -s -H "Content-Type: application/json" \
+      -X POST -d "{\"content\":\"$1\"}" "$DISCORD_WEBHOOK_URL" >/dev/null || true
+  fi
+}
+
+handle_error() {
+  echo -e "\033[31mError occurred during the installation of $1.\033[0m" | tee -a "$ERROR_LOG"
+  FAILED_LIST+=("$1")
+  send_discord "⚠️ Failed to install **$1**"
+}
+
+retry_cmd() {
+  local cmd=$1
+  local label=$2
+  local count=0
+  until eval "$cmd"; do
+    count=$((count+1))
+    if (( count >= RETRY_COUNT )); then
+      handle_error "$label"
+      return 1
+    fi
+    echo -e "\033[33mRetrying $label ($count/$RETRY_COUNT) after $RETRY_DELAY seconds...\033[0m"
+    sleep "$RETRY_DELAY"
+  done
+  SUCCESS_LIST+=("$label")
+  send_discord "✅ Successfully installed **$label**"
+}
+
+check_internet() {
+  if ! ping -c 1 google.com &>/dev/null; then
+    echo -e "\033[31mNo internet connection. Please check your connection and try again.\033[0m" | tee -a "$ERROR_LOG"
+    send_discord "❌ No internet connection detected. Aborting."
+    exit 1
+  fi
+}
+
+install_package() {
+  if pacman -Qi "$1" &>/dev/null; then
+    echo -e "\033[33m$1 is already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("$1")
+  else
+    echo "Installing $1..."
+    $DRY_RUN || retry_cmd "sudo pacman -S --noconfirm --needed \"$1\"" "$1 (Pacman)"
+  fi
+}
+
+install_aur_package() {
+  if pacman -Qi "$1" &>/dev/null || command -v "$1" &>/dev/null; then
+    echo -e "\033[33m$1 is already installed, skipping AUR...\033[0m"
+    SKIPPED_LIST+=("$1")
+    return
+  fi
+
+  if ! command -v yay &>/dev/null; then
+    echo "Installing AUR helper 'yay'..."
+    $DRY_RUN || retry_cmd "sudo pacman -S --noconfirm --needed base-devel git" "base-devel/git"
+    $DRY_RUN || (git clone https://aur.archlinux.org/yay.git /tmp/yay && (cd /tmp/yay && makepkg -si --noconfirm)) || handle_error "yay"
+  fi
+
+  $DRY_RUN || retry_cmd "yay -S --noconfirm --needed \"$1\"" "$1 (AUR)"
+}
+
+install_flatpak_app() {
+  if flatpak list | grep -q "$1"; then
+    echo -e "\033[33m$1 is already installed.\033[0m"
+    SKIPPED_LIST+=("$1")
+  else
+    echo "Installing $1..."
+    $DRY_RUN || retry_cmd "sudo flatpak install flathub \"$1\" -y" "$1 (Flatpak)"
+  fi
+}
+
+uninstall_firefox() {
+  echo "Uninstalling Firefox..."
+  
+  if ! pacman -Qi firefox &>/dev/null; then
+    echo -e "\033[33mFirefox is not installed, skipping uninstall...\033[0m"
+    SKIPPED_LIST+=("Firefox uninstall")
+    return
+  fi
+  
+  if $DRY_RUN; then
+    echo "DRY RUN: Would uninstall Firefox"
+    SUCCESS_LIST+=("Firefox uninstall")
+  else
+    if sudo pacman -Rns firefox --noconfirm; then
+      SUCCESS_LIST+=("Firefox uninstall")
+      send_discord "✅ Successfully uninstalled **Firefox**"
+      echo -e "\033[32mFirefox uninstalled successfully!\033[0m"
+    else
+      handle_error "Firefox uninstall"
+    fi
+  fi
+}
+
+install_lazyvim() {
+  echo "Setting up LazyVim..."
+  
+  # Check if LazyVim is already installed
+  if [[ -d "$HOME/.config/nvim" ]] && [[ -f "$HOME/.config/nvim/lua/config/lazy.lua" ]]; then
+    echo -e "\033[33mLazyVim appears to be already installed, skipping...\033[0m"
+    SKIPPED_LIST+=("LazyVim")
+    return
+  fi
+  
+  # Backup existing nvim config if it exists
+  if [[ -d "$HOME/.config/nvim" ]]; then
+    echo "Backing up existing Neovim config..."
+    $DRY_RUN || mv "$HOME/.config/nvim" "$HOME/.config/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  if [[ -d "$HOME/.local/share/nvim" ]]; then
+    echo "Backing up existing Neovim data..."
+    $DRY_RUN || mv "$HOME/.local/share/nvim" "$HOME/.local/share/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  if [[ -d "$HOME/.local/state/nvim" ]]; then
+    echo "Backing up existing Neovim state..."
+    $DRY_RUN || mv "$HOME/.local/state/nvim" "$HOME/.local/state/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  if [[ -d "$HOME/.cache/nvim" ]]; then
+    echo "Backing up existing Neovim cache..."
+    $DRY_RUN || mv "$HOME/.cache/nvim" "$HOME/.cache/nvim.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  
+  # Clone LazyVim starter template
+  if $DRY_RUN; then
+    echo "DRY RUN: Would clone LazyVim starter template"
+    SUCCESS_LIST+=("LazyVim")
+  else
+    if git clone https://github.com/LazyVim/starter "$HOME/.config/nvim"; then
+      # Remove .git folder to make it your own
+      rm -rf "$HOME/.config/nvim/.git"
+      SUCCESS_LIST+=("LazyVim")
+      send_discord "✅ Successfully installed **LazyVim**"
+      echo -e "\033[32mLazyVim installed successfully! Run 'nvim' to complete setup.\033[0m"
+    else
+      handle_error "LazyVim"
+    fi
+  fi
+}
+
+setup_autostart() {
+  echo "Setting up autostart for Steam and Discord..."
+  
+  # Create autostart directory if it doesn't exist
+  $DRY_RUN || mkdir -p "$HOME/.config/autostart"
+  
+  # Steam autostart
+  if [[ ! -f "$HOME/.config/autostart/steam.desktop" ]]; then
+    if $DRY_RUN; then
+      echo "DRY RUN: Would create Steam autostart entry"
+    else
+      cat > "$HOME/.config/autostart/steam.desktop" << EOF
+[Desktop Entry]
+Name=Steam
+Comment=Application for managing and playing games on Steam
+Exec=steam -silent
+Icon=steam
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;Game;
+MimeType=x-scheme-handler/steam;
+Actions=Store;Community;Library;Servers;Screenshots;News;Settings;BigPicture;Friends;
+PrefersNonDefaultGPU=true
+X-KDE-RunOnDiscreteGpu=true
+EOF
+      echo -e "\033[32mSteam autostart configured!\033[0m"
+    fi
+  else
+    echo -e "\033[33mSteam autostart already configured, skipping...\033[0m"
+  fi
+  
+  # Discord autostart
+  if [[ ! -f "$HOME/.config/autostart/discord.desktop" ]]; then
+    if $DRY_RUN; then
+      echo "DRY RUN: Would create Discord autostart entry"
+    else
+      cat > "$HOME/.config/autostart/discord.desktop" << EOF
+[Desktop Entry]
+Name=Discord
+StartupWMClass=discord
+Comment=All-in-one cross-platform voice and text chat for gamers
+GenericName=Internet Messenger
+Exec=flatpak run com.discordapp.Discord --start-minimized
+Icon=com.discordapp.Discord
+Type=Application
+Categories=Network;InstantMessaging;
+Path=/usr/bin
+EOF
+      echo -e "\033[32mDiscord autostart configured!\033[0m"
+    fi
+  else
+    echo -e "\033[33mDiscord autostart already configured, skipping...\033[0m"
+  fi
+  
+  if $DRY_RUN; then
+    SUCCESS_LIST+=("Autostart setup")
+  else
+    SUCCESS_LIST+=("Autostart setup")
+    send_discord "✅ Successfully configured **Steam and Discord autostart**"
+  fi
+}
+
+progress_bar() {
+  local total=$1
+  local current=$2
+  local percent=$((current * 100 / total))
+  local filled=$((percent / 2))
+  local empty=$((50 - filled))
+  printf "\r["
+  printf "%0.s#" $(seq 1 "$filled")
+  printf "%0.s-" $(seq 1 "$empty")
+  printf "] %d%%" "$percent"
+}
+
+increment_progress() {
+  {
+    CURRENT=$((CURRENT+1))
+    progress_bar "$TOTAL" "$CURRENT"
+  } 200>/tmp/progress.lock
+}
+
+# ---- Config ----
+SYSTEM_PACKAGES=(
+  base-devel git wget curl vim neovim htop nano screenfetch ffmpeg vlc
+  alsa-utils wireguard-tools networkmanager dhclient ttf-dejavu ttf-liberation
+  noto-fonts ttf-roboto fastfetch cmatrix cowsay make gcc clang
+  python python-pip nodejs npm unzip zip p7zip xarchiver flatpak
+  android-tools qbittorrent
+)
+
+AUR_PACKAGES=(
+  pipes.sh
+)
+
+FLATPAK_APPS=(
+  com.valvesoftware.Steam
+  com.discordapp.Discord
+  com.brave.Browser
+  com.github.aychray.Sober
+  io.freetubeproject.FreeTube
+)
+
+TOTAL=$(( ${#SYSTEM_PACKAGES[@]} + ${#AUR_PACKAGES[@]} + ${#FLATPAK_APPS[@]} + 3 ))
+CURRENT=0
+
+# ---- Run ----
+check_internet
+send_discord "🚀 Starting setup with $TOTAL tasks..."
+
+echo "Updating system..."
+$DRY_RUN || sudo pacman -Syu --noconfirm
+
+export -f install_package install_aur_package install_flatpak_app uninstall_firefox install_lazyvim setup_autostart handle_error increment_progress progress_bar retry_cmd send_discord
+export TOTAL CURRENT DRY_RUN RETRY_COUNT RETRY_DELAY ERROR_LOG SUCCESS_LIST FAILED_LIST SKIPPED_LIST
+
+printf "%s\n" "${SYSTEM_PACKAGES[@]}" | xargs -n1 -P"$(nproc)" bash -c 'install_package "$0"; increment_progress' || true
+
+printf "%s\n" "${AUR_PACKAGES[@]}" | xargs -n1 -P1 bash -c 'install_aur_package "$0"; increment_progress' || true
+
+echo ""
+echo "Installing Flatpak applications..."
+$DRY_RUN || sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+printf "%s\n" "${FLATPAK_APPS[@]}" | xargs -n1 -P"$(nproc)" bash -c 'install_flatpak_app "$0"; increment_progress' || true
+
+echo ""
+echo "Uninstalling Firefox..."
+uninstall_firefox
+increment_progress
+
+echo ""
+echo "Installing LazyVim..."
+install_lazyvim
+increment_progress
+
+echo ""
+echo "Setting up autostart applications..."
+setup_autostart
+increment_progress
+
+echo ""
+echo "Cleaning up unused packages..."
+$DRY_RUN || sudo pacman -Rns $(pacman -Qdtq) --noconfirm 2>/dev/null || echo "No orphan packages to remove."
+
+# ---- Summary ----
+echo -e "\n\033[1m===== Setup Summary =====\033[0m"
+if (( ${#SUCCESS_LIST[@]} )); then
+  echo -e "\033[32mSuccessful installs:\033[0m ${SUCCESS_LIST[*]}"
+fi
+if (( ${#SKIPPED_LIST[@]} )); then
+  echo -e "\033[33mSkipped installs:\033[0m ${SKIPPED_LIST[*]}"
+fi
+if (( ${#FAILED_LIST[@]} )); then
+  echo -e "\033[31mFailed installs:\033[0m ${FAILED_LIST[*]}"
+  echo "Check $ERROR_LOG for details."
+fi
+
+echo "" | tee "$SUMMARY_JSON"
+echo "{\n  \"success\": [$(printf '"%s",' "${SUCCESS_LIST[@]}" | sed 's/,$//')],\n  \"skipped\": [$(printf '"%s",' "${SKIPPED_LIST[@]}" | sed 's/,$//')],\n  \"failed\": [$(printf '"%s",' "${FAILED_LIST[@]}" | sed 's/,$//')]\n}" > "$SUMMARY_JSON"
+
+send_discord "📊 Setup finished! ✅ ${#SUCCESS_LIST[@]} success, ⚠️ ${#SKIPPED_LIST[@]} skipped, ❌ ${#FAILED_LIST[@]} failed."
+
+echo -e "\033[32mSetup complete!\033[0m"
