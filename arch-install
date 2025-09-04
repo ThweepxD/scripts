@@ -7,8 +7,8 @@ ERROR_LOG="errors.log"
 SUMMARY_JSON="summary.json"
 DISCORD_WEBHOOK_URL="https://discordapp.com/api/webhooks/1412280278533144666/53oHRNs4WGdaxWz8qbeVipDRiD3hamTYi9FBhv9cxjoksjBprbTUdhwZxWrFIO69KBRa"
 
-exec > >(ts '[%Y-%m-%d %H:%M:%S]' | tee -i "$LOG_FILE")
-exec 2> >(ts '[%Y-%m-%d %H:%M:%S]' | tee -i "$LOG_FILE" "$ERROR_LOG" >&2)
+exec > >(tee -i "$LOG_FILE")
+exec 2> >(tee -i "$LOG_FILE" "$ERROR_LOG" >&2)
 
 trap 'echo -e "\033[31mUnexpected error on line $LINENO. Exiting.\033[0m" | tee -a "$ERROR_LOG"; send_discord "❌ Unexpected error on line $LINENO"; exit 1' ERR
 
